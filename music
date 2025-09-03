@@ -7,7 +7,22 @@ import argparse
 import subprocess
 import sys
 import os
+import glob
 from pathlib import Path
+
+def cleanup_old_temp_files():
+    """Clean up any leftover temporary files from previous runs"""
+    tmp_dir = Path("tmp")
+    if tmp_dir.exists():
+        # Remove old temp files (older than 1 hour)
+        import time
+        current_time = time.time()
+        for file_path in tmp_dir.glob("*"):
+            if file_path.is_file() and (current_time - file_path.stat().st_mtime) > 3600:
+                try:
+                    file_path.unlink()
+                except:
+                    pass
 
 def parse_time(time_str):
     """Parse time string like ':10' or '1:30' into seconds"""
@@ -29,60 +44,42 @@ def extract_audio(input_file, start_time, end_time, output_file=None):
         input_path = Path(input_file)
         output_file = f"{input_path.stem}_extract_{start_time}s-{end_time}s{input_path.suffix}"
     
+    # Ensure tmp directory exists
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(exist_ok=True)
+    
+    # If output_file is a temp file, put it in tmp directory
+    if output_file.startswith("temp_") or output_file.startswith("looped_"):
+        output_file = tmp_dir / output_file
+    
     duration = end_time - start_time
     
-    # Determine if we can use stream copy or need to re-encode
-    input_ext = Path(input_file).suffix.lower()
-    output_ext = Path(output_file).suffix.lower()
-    
-    # If input and output formats are the same, try copy first
-    if input_ext == output_ext:
-        cmd = [
-            'ffmpeg',
-            '-i', input_file,
-            '-ss', str(start_time),
-            '-t', str(duration),
-            '-c', 'copy',  # Copy without re-encoding for speed
-            '-y',  # Overwrite output file
-            output_file
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        # If copy failed, fall back to re-encoding
-        if result.returncode != 0:
-            print("Stream copy failed, re-encoding...")
-            cmd = [
-                'ffmpeg',
-                '-i', input_file,
-                '-ss', str(start_time),
-                '-t', str(duration),
-                '-y',  # Overwrite output file
-                output_file
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-    else:
-        # Different formats, always re-encode
-        cmd = [
-            'ffmpeg',
-            '-i', input_file,
-            '-ss', str(start_time),
-            '-t', str(duration),
-            '-y',  # Overwrite output file
-            output_file
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+    # Always re-encode for segment extraction to avoid corruption issues
+    # This is especially important for MP3 files which don't handle stream copy well
+    cmd = [
+        'ffmpeg',
+        '-i', input_file,
+        '-ss', str(start_time),
+        '-t', str(duration),
+        '-y',  # Overwrite output file
+        output_file
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode == 0:
         print(f"Extracted audio segment: {output_file}")
-        return output_file
+        return str(output_file)
     else:
         print(f"Error extracting audio: {result.stderr}")
         return None
 
 def loop_audio(input_files, start_time=None, end_time=None):
-    """Loop audio using a simpler approach - supports multiple files"""
+    """Loop audio using streaming approach - supports multiple files"""
     temp_files = []
+    
+    # Ensure tmp directory exists
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(exist_ok=True)
     
     try:
         # Parse input files (comma-separated)
@@ -94,67 +91,95 @@ def loop_audio(input_files, start_time=None, end_time=None):
         print(f"Looping {len(file_list)} audio file(s): {', '.join(file_list)}")
         print("Press Ctrl+C to stop...")
         
-        # Process each file
-        processed_files = []
-        for i, input_file in enumerate(file_list):
+        # Stream directly to ffplay without creating large files
+        print("Starting looped audio stream...")
+        
+        if len(file_list) == 1:
+            # Single file - stream loop directly
+            input_file = file_list[0]
             if start_time is not None and end_time is not None:
-                # Extract segment first, then add to list
-                input_ext = Path(input_file).suffix.lower()
-                temp_file = f"temp_loop_{os.getpid()}_{i}{input_ext}"
-                temp_files.append(temp_file)
-                extracted = extract_audio(input_file, start_time, end_time, temp_file)
-                if not extracted:
-                    print(f"Failed to extract segment from {input_file}")
-                    return False
-                processed_files.append(extracted)
+                # Extract segment and stream loop
+                cmd = [
+                    'ffmpeg',
+                    '-stream_loop', '-1',  # Loop infinitely
+                    '-i', input_file,
+                    '-ss', str(start_time),
+                    '-t', str(end_time - start_time),
+                    '-f', 'wav',
+                    '-acodec', 'pcm_s16le',
+                    '-ar', '44100',
+                    '-ac', '2',
+                    '-'
+                ]
             else:
-                # Use the entire file
-                processed_files.append(input_file)
-        
-        # Create a concatenated looped version using ffmpeg
-        looped_file = f"looped_{os.getpid()}.wav"
-        
-        if len(processed_files) == 1:
-            # Single file - simple loop
-            cmd = [
-                'ffmpeg',
-                '-stream_loop', '10',  # Loop 10 times
-                '-i', processed_files[0],
-                '-c', 'copy',
-                '-y',
-                looped_file
-            ]
+                # Stream entire file loop
+                cmd = [
+                    'ffmpeg',
+                    '-stream_loop', '-1',  # Loop infinitely
+                    '-i', input_file,
+                    '-f', 'wav',
+                    '-acodec', 'pcm_s16le',
+                    '-ar', '44100',
+                    '-ac', '2',
+                    '-'
+                ]
         else:
-            # Multiple files - create a filter to concatenate and loop
-            # First create a concat file list
-            concat_file = f"concat_{os.getpid()}.txt"
-            with open(concat_file, 'w') as f:
-                for file_path in processed_files:
-                    f.write(f"file '{os.path.abspath(file_path)}'\n")
+            # Multiple files - create a temporary concatenated file first, then loop it
+            concat_file = tmp_dir / f"concat_{os.getpid()}.wav"
             
-            # Use concat demuxer to join files, then loop
+            # First, create the concatenated version
+            inputs = []
+            filters = []
+            
+            for i, file_path in enumerate(file_list):
+                inputs.extend(['-i', file_path])
+                if start_time is not None and end_time is not None:
+                    filters.append(f'[{i}:a]atrim=start={start_time}:end={end_time}[a{i}]')
+                else:
+                    filters.append(f'[{i}:a]acopy[a{i}]')
+            
+            # Concatenate all segments
+            concat_inputs = ''.join([f'[a{i}]' for i in range(len(file_list))])
+            filters.append(f'{concat_inputs}concat=n={len(file_list)}:v=0:a=1[out]')
+            
+            concat_cmd = [
+                'ffmpeg'
+            ] + inputs + [
+                '-filter_complex', ';'.join(filters),
+                '-map', '[out]',
+                '-f', 'wav',
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-y',
+                str(concat_file)
+            ]
+            
+            print("Creating concatenated version...")
+            concat_result = subprocess.run(concat_cmd, capture_output=True, text=True)
+            
+            if concat_result.returncode != 0:
+                print(f"Error creating concatenated version: {concat_result.stderr}")
+                return False
+            
+            # Now stream loop the concatenated file
             cmd = [
                 'ffmpeg',
-                '-stream_loop', '10',  # Loop the concatenated result 10 times
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', concat_file,
-                '-c', 'copy',
-                '-y',
-                looped_file
+                '-stream_loop', '-1',  # Loop infinitely
+                '-i', str(concat_file),
+                '-f', 'wav',
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-ac', '2',
+                '-'
             ]
         
-        print("Creating looped version...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # Stream directly to ffplay (which supports stdin)
+        ffmpeg_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        player = subprocess.Popen(['ffplay', '-nodisp', '-'], stdin=ffmpeg_process.stdout)
         
-        if result.returncode != 0:
-            print(f"Error creating looped version: {result.stderr}")
-            return False
-        
-        print("Playing looped audio...")
-        
-        # Play the looped file
-        player = subprocess.Popen(['afplay', looped_file])
+        # Close the stdout of ffmpeg to allow it to receive a SIGPIPE if ffplay stops
+        ffmpeg_process.stdout.close()
         
         # Wait for user to stop
         try:
@@ -167,8 +192,14 @@ def loop_audio(input_files, start_time=None, end_time=None):
     finally:
         # Clean up processes
         try:
-            if 'player' in locals():
+            if 'player' in locals() and player and player.poll() is None:
                 player.terminate()
+        except:
+            pass
+        
+        try:
+            if 'ffmpeg_process' in locals() and ffmpeg_process and ffmpeg_process.poll() is None:
+                ffmpeg_process.terminate()
         except:
             pass
         
@@ -176,14 +207,15 @@ def loop_audio(input_files, start_time=None, end_time=None):
         for temp_file in temp_files:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
-        if 'looped_file' in locals() and os.path.exists(looped_file):
-            os.remove(looped_file)
         if 'concat_file' in locals() and os.path.exists(concat_file):
             os.remove(concat_file)
     
     return True
 
 def main():
+    # Clean up old temp files on startup
+    cleanup_old_temp_files()
+    
     parser = argparse.ArgumentParser(description='Music CLI Tool')
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
